@@ -9,7 +9,7 @@ Transform any Git repository into a queryable, interactive knowledge base powere
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-blue?style=for-the-badge&logo=typescript)](https://www.typescriptlang.org/)
 [![Supabase](https://img.shields.io/badge/Supabase-PostgreSQL-3ECF8E?style=for-the-badge&logo=supabase)](https://supabase.com/)
 
-[Live Demo](#) • [Documentation](./docs/BACKEND.md) • [Video Pitch](#) • [Hackathon Submission](#)
+[Live Demo](./docs/videos/live-demo.mp4) • [Documentation](./docs/BACKEND.md) • [Video Pitch](./docs/videos/video-pitch.mp4) • [Hackathon Submission](#)
 
 ---
 
@@ -360,7 +360,7 @@ MIT License - see [LICENSE](./LICENSE) for details.
 
 Built by Manish Tiwari for the IBM Build on Bob Hackathon 2026.
 
-- 🌐 [Live Demo](#)
+- 🌐 [Live Demo](./docs/videos/live-demo.mp4)
 - 📧 [Email](mailto:tiwarimanish2810@gmail.com)
 - 💼 [LinkedIn](https://www.linkedin.com/in/manish-tiwarisec/)
 
