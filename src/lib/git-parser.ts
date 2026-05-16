@@ -6,7 +6,7 @@
 import simpleGit, { SimpleGit, LogResult } from 'simple-git';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp, rm, mkdir } from 'fs/promises';
 import { v4 as uuid } from 'uuid';
 
 export interface ParsedCommit {
@@ -59,6 +59,7 @@ export async function cloneAndParse(
 
   // Clone to temp directory
   const tempBase = join(tmpdir(), 'ctm-repos');
+  await mkdir(tempBase, { recursive: true });
   const repoDir = await mkdtemp(join(tempBase, `${repoName.replace('/', '-')}-`).replace(/\\/g, '/'));
   const git: SimpleGit = simpleGit();
 

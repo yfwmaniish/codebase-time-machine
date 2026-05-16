@@ -57,6 +57,21 @@ create table if not exists files (
 create index if not exists idx_files_repo_id on files(repo_id);
 create index if not exists idx_files_path on files(repo_id, path);
 
+-- File Changes (junction table for commits <-> files)
+create table if not exists file_changes (
+  id uuid primary key default gen_random_uuid(),
+  commit_id uuid references commits(id) on delete cascade,
+  file_id uuid references files(id) on delete cascade,
+  change_type text not null check (change_type in ('added', 'modified', 'deleted', 'renamed')),
+  insertions int default 0,
+  deletions int default 0,
+  created_at timestamptz default now()
+);
+
+create index if not exists idx_file_changes_commit on file_changes(commit_id);
+create index if not exists idx_file_changes_file on file_changes(file_id);
+create unique index if not exists idx_file_changes_unique on file_changes(commit_id, file_id);
+
 -- Authors
 create table if not exists authors (
   id uuid primary key default gen_random_uuid(),

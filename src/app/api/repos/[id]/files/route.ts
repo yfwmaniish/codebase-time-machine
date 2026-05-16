@@ -1,5 +1,5 @@
 // ============================================================
-// GET /api/repos/[id]/files — File tree
+// GET /api/repos/[id]/files — File tree and file details
 // ============================================================
 
 import { NextRequest, NextResponse } from 'next/server';
@@ -14,62 +14,105 @@ export async function GET(
   const { id: repoId } = await params;
   const supabase = createServerClient();
 
-  const { data: files, error } = await supabase
-    .from('files')
-    .select('id, path, language, commit_count, unique_authors, risk_score')
-    .eq('repo_id', repoId)
-    .order('path', { ascending: true });
+  try {
+    // Get all files for the repository
+    const { data: files, error } = await supabase
+      .from('files')
+      .select('*')
+      .eq('repo_id', repoId)
+      .order('path', { ascending: true });
 
-  if (error) {
-    return NextResponse.json({ error: 'Failed to fetch files' }, { status: 500 });
+    if (error) {
+      return NextResponse.json(
+        { error: 'Failed to fetch files' },
+        { status: 500 }
+      );
+    }
+
+    // Build file tree structure
+    const fileTree = buildFileTree(files || []);
+
+    return NextResponse.json({
+      files: files || [],
+      tree: fileTree,
+      total: files?.length || 0,
+    });
+  } catch (error) {
+    console.error('Files API error:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
   }
-
-  // Build tree structure
-  const tree = buildFileTree(files || []);
-
-  return NextResponse.json({ files: files || [], tree });
 }
 
-interface TreeNode {
+interface FileNode {
   name: string;
   path: string;
   type: 'file' | 'directory';
-  children?: TreeNode[];
   language?: string;
-  commit_count?: number;
   risk_score?: number;
+  commit_count?: number;
+  unique_authors?: number;
+  children?: FileNode[];
 }
 
-function buildFileTree(files: Array<{ path: string; language: string | null; commit_count: number; risk_score: number }>): TreeNode[] {
-  const root: TreeNode[] = [];
+function buildFileTree(files: Array<{
+  path: string;
+  language: string | null;
+  risk_score: number;
+  commit_count: number;
+  unique_authors: number;
+}>): FileNode[] {
+  const root: FileNode[] = [];
+  const nodeMap = new Map<string, FileNode>();
 
-  for (const file of files) {
+  // Sort files by path for consistent tree building
+  const sortedFiles = [...files].sort((a, b) => a.path.localeCompare(b.path));
+
+  for (const file of sortedFiles) {
     const parts = file.path.split('/');
-    let current = root;
+    let currentPath = '';
+    let currentLevel = root;
 
     for (let i = 0; i < parts.length; i++) {
       const part = parts[i];
-      const isFile = i === parts.length - 1;
-      const existing = current.find(n => n.name === part);
+      const isLastPart = i === parts.length - 1;
+      currentPath = currentPath ? `${currentPath}/${part}` : part;
 
-      if (existing) {
-        if (!isFile && existing.children) {
-          current = existing.children;
-        }
-      } else {
-        const node: TreeNode = {
+      // Check if node already exists
+      let node = nodeMap.get(currentPath);
+
+      if (!node) {
+        // Create new node
+        node = {
           name: part,
-          path: parts.slice(0, i + 1).join('/'),
-          type: isFile ? 'file' : 'directory',
-          ...(isFile ? { language: file.language || undefined, commit_count: file.commit_count, risk_score: file.risk_score } : { children: [] }),
+          path: currentPath,
+          type: isLastPart ? 'file' : 'directory',
         };
-        current.push(node);
-        if (!isFile && node.children) {
-          current = node.children;
+
+        // Add file-specific properties
+        if (isLastPart) {
+          node.language = file.language || undefined;
+          node.risk_score = file.risk_score;
+          node.commit_count = file.commit_count;
+          node.unique_authors = file.unique_authors;
+        } else {
+          node.children = [];
         }
+
+        nodeMap.set(currentPath, node);
+        currentLevel.push(node);
+      }
+
+      // Move to next level
+      if (!isLastPart && node.children) {
+        currentLevel = node.children;
       }
     }
   }
 
   return root;
 }
+
+// Made with Bob
