@@ -1,375 +1,186 @@
-# 🕰️ Codebase Time Machine
+# Codebase Time Machine
 
-> **Git tells you *what* changed. We tell you *why*.**
+Codebase Time Machine turns a public Git repository into a queryable, AI-assisted knowledge base. It clones a repo, parses its full commit history, and stores it in Postgres alongside vector embeddings of each commit message. From there it exposes a set of tools — a RAG-backed chat interface, auto-generated architectural decision records, a contributor knowledge graph, and a file risk heatmap — that are meant to answer the question Git alone can't: *why* does the code look the way it does. It was originally built solo for the IBM "Build on Bob" hackathon (developed inside the IBM Bob IDE, see `bob_sessions/`), using IBM watsonx.ai's Granite models for generation and embeddings.
 
-Transform any Git repository into a queryable, interactive knowledge base powered by IBM watsonx.ai. Never lose tribal knowledge again.
+## What it actually does
 
-[![Built with IBM Bob](https://img.shields.io/badge/Built%20with-IBM%20Bob-7C5CFF?style=for-the-badge)](https://www.ibm.com/products/watsonx-ai)
-[![Next.js 14](https://img.shields.io/badge/Next.js-14-black?style=for-the-badge&logo=next.js)](https://nextjs.org/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5-blue?style=for-the-badge&logo=typescript)](https://www.typescriptlang.org/)
-[![Supabase](https://img.shields.io/badge/Supabase-PostgreSQL-3ECF8E?style=for-the-badge&logo=supabase)](https://supabase.com/)
+Based on the implemented API routes (`src/app/api/**`) and the corresponding frontend pages (`src/app/[repoId]/**`):
 
-[Live Demo](./docs/videos/live-demo.mp4) • [Documentation](./docs/BACKEND.md) • [Video Pitch](./docs/videos/video-pitch.mp4) • [Hackathon Submission](#)
+- **Repository ingestion** — `POST /api/repos/ingest` validates a `https://github.com/owner/repo` URL, creates a `repositories` row, and kicks off a background worker (`POST /api/repos/[id]/process`) that clones the repo with `simple-git`, walks up to 500 commits (`git log --stat` + `git diff-tree --numstat` per commit), and derives per-file and per-author statistics (churn, insertions/deletions, files touched, "domains" based on top-level directories).
+- **Live ingestion progress** — `GET /api/repos/[id]/status` is a Server-Sent Events endpoint that polls the repository's status column (`pending → cloning → parsing → embedding → ready`/`failed`) once a second and streams progress percentages to the indexing page.
+- **Why Engine (chat)** — `POST /api/repos/[id]/chat` runs a small RAG pipeline (`src/lib/rag.ts`): it embeds the user's question, does a `pgvector` similarity search over commit-message embeddings (via the `match_commits` SQL function, with a Postgres full-text-search fallback if vector search errors out), and asks the LLM to answer using only the retrieved commits, citing them by SHA. Chat sessions and messages are persisted (`chat_sessions`, `chat_messages`).
+- **Ghost Author mode** — the same chat endpoint accepts `mode: "ghost"` plus a `ghost_author_id`; it builds a profile of that contributor from their aggregated stats and prompts the model to answer "in character," with an explicit disclaimer baked into the prompt that this is an AI synthesis, not the real person.
+- **Auto-generated ADRs** — `POST /api/repos/[id]/adrs` pulls the 100 commits with the most files changed and asks the LLM to extract 3–8 Architectural Decision Records (context/decision/consequences/supporting commits) in Markdown; `GET /api/repos/[id]/adrs` lists what's been generated and stored.
+- **File timeline** — `GET /api/repos/[id]/timeline?file=<path>` returns the commit history for a single file, and `GET /api/commits/[sha]?summary=true` returns commit metadata with an optional AI-generated plain-English summary of the diff.
+- **Knowledge graph** — `GET /api/repos/[id]/graph` assembles nodes for top files, authors, high-impact commits, and generated ADRs, plus edges (author→commit "wrote", author→file "modified" inferred from directory overlap) for a D3-driven force graph on the frontend.
+- **Risk heatmap** — `GET /api/repos/[id]/heatmap` scores every file as `0.6 * churn + 0.4 * unique-author-count`, buckets it into low/medium/high/critical, and (with `?explain=true`) asks the LLM for a one-to-two-sentence explanation of the top risky files; the frontend renders this as a treemap.
+- **Onboarding plans** — `POST /api/repos/[id]/onboarding` takes a role (`frontend`/`backend`/`fullstack`/`devops`/`mobile`) and seniority level and asks the LLM to generate a role-specific onboarding plan grounded in the repo's actual language breakdown and file list.
+- **Contributors** — `GET /api/repos/[id]/authors` lists contributors with commit/insertion/deletion counts and inferred domains of expertise.
+- **Demo mode** — every LLM and embedding call in `src/lib/watsonx.ts` checks `DEMO_MODE=true` (or the absence of a watsonx API key) and returns realistic canned responses instead of calling IBM watsonx.ai, so the whole app is runnable and clickable without any AI credentials.
 
----
+The frontend (`src/app/page.tsx` + `src/components/sections/*`) is a marketing-style landing page with a repo-ingestion form, followed by a per-repo dashboard (`src/app/[repoId]/page.tsx`) that links out to dedicated pages for chat, time travel, ADRs, ghost author, and the knowledge graph.
 
-> **⚠️ Important Note:** This project was built entirely **solo**. I currently have a **throat infection** and am unable to speak, which is why the video presentation uses an **AI voiceover** instead of my own voice. I apologize for the inconvenience — the project, code, and all development work are 100% my own.
+## Not implemented / known gaps
 
----
+These are referenced in the docs as planned or partial and are worth being upfront about:
 
-## 🎯 The Problem
+- No user authentication — this is a single-user MVP; anyone with a repo ID can query it.
+- No private repository support — ingestion only works against public GitHub URLs.
+- The `file_changes` junction table defined in `supabase-schema.sql` exists in the schema but isn't populated by the ingestion worker; file↔commit relationships are reconstructed from the raw commit/file records instead.
+- Rate limiting (`src/lib/middleware.ts`) is an in-memory `Map`, not the Redis-backed limiter implemented in `src/lib/queue.ts` — the BullMQ/Upstash queue module exists in the codebase but isn't currently wired into the ingestion or chat routes, which run as plain fire-and-forget `fetch` calls instead of queued jobs.
+- No `.env.example` file is currently checked into the repo (the `.gitignore` pattern `.env*` excludes it); see [Environment variables](#environment-variables) below for what to set manually.
 
-Software teams lose **2-4 weeks of productivity per new hire** on codebase onboarding. When senior engineers leave, critical context vanishes with them. The "why" behind code decisions lives in:
-- 💬 Dead Slack threads
-- 🧠 Departed engineers' heads  
-- 📝 Vague PR descriptions ("fix")
-- 🗑️ Lost documentation
+## Tech stack
 
-**Existing tools (Copilot, Cursor, Cody) treat code as a snapshot. We treat it as a story.**
+Read directly from `package.json`:
 
----
+| Layer | Technology |
+|---|---|
+| Framework | Next.js 16 (App Router, Turbopack dev server), React 19, TypeScript |
+| Styling / UI | Tailwind CSS 4, Radix UI primitives, `class-variance-authority`, `lucide-react` icons, Framer Motion (used throughout the UI, though not currently declared in `package.json` — see note below) |
+| Visualization | D3.js |
+| State / data fetching | Zustand, TanStack Query |
+| Database | Supabase (PostgreSQL) with the `pgvector` extension for embedding similarity search |
+| Background jobs / caching | BullMQ + Upstash Redis (`ioredis`, `@upstash/redis`) — implemented in `src/lib/queue.ts` but not yet called from any route |
+| Git operations | `simple-git` |
+| AI | IBM watsonx.ai — Granite models for chat/completion, Slate for embeddings (with a demo-mode mock fallback) |
+| Markdown rendering | `react-markdown` + `remark-gfm` |
+| Deployment | Vercel (see `vercel.json`) |
 
-## 💡 The Solution
+> Note: several UI components import from `framer-motion`, but it isn't listed in `package.json`'s dependencies. Run `npm install framer-motion` if you hit a module-not-found error after `npm install`.
 
-Codebase Time Machine reframes your Git repository as a **temporal knowledge graph**. Ask questions in natural language. Travel through time. Understand the "why" behind every line of code.
+## Architecture
 
-### Core Features
+```
+Frontend (Next.js App Router, client components)
+  landing page + repo dashboard + chat/time-travel/adrs/ghost/graph pages
+        │  fetch() calls + SSE
+        ▼
+API routes (Next.js Route Handlers, src/app/api/**)
+  ingestion · chat (RAG) · ADR generation · graph · heatmap · onboarding
+        │
+        ├──► src/lib/git-parser.ts   — clone + parse commit history (simple-git)
+        ├──► src/lib/rag.ts          — retrieval + prompt construction
+        ├──► src/lib/watsonx.ts      — IBM watsonx.ai client (or demo-mode mocks)
+        ├──► src/lib/middleware.ts   — in-memory rate limiting, error helpers
+        └──► src/lib/supabase.ts     — lazily-initialized Supabase clients
+        ▼
+Supabase Postgres + pgvector
+  repositories · commits (+ embedding vector(384)) · files · authors
+  adrs · chat_sessions · chat_messages
+  match_commits() — pgvector cosine-similarity RPC
+```
 
-#### 🤖 **Why Engine** — Chat with Your Codebase's History
-Ask questions like:
-- "Why does the auth middleware check tokens twice?"
-- "What led to the decision to use Redis?"
-- "Who designed the payment flow and what were their considerations?"
+Repository ingestion is a two-step handoff: `POST /api/repos/ingest` creates the DB row and fires an unawaited `fetch` to `POST /api/repos/[id]/process`, which does the actual cloning/parsing/embedding work and updates the row's `status` as it goes. The frontend polls `GET /api/repos/[id]/status` (SSE) to show progress. See `docs/BACKEND.md` for the full endpoint-by-endpoint request/response reference.
 
-Get narrative answers with **commit-level citations**.
-
-#### ⏰ **Time Travel Mode** — Visual File Evolution
-- Scrub through any file's complete history
-- See major moments with AI-generated summaries
-- Understand how code evolved and why
-
-#### 📜 **Auto-Generated ADRs** — Capture Architectural Decisions
-Automatically extract Architectural Decision Records from Git history:
-- What was decided
-- Why it was decided
-- What the consequences were
-- Which commits prove it
-
-#### 👻 **Ghost Author Mode** — Chat with Departed Engineers
-Synthesize expertise profiles from Git contributions:
-- "What would Sarah say about this module?"
-- Scoped to their actual work
-- Clearly labeled as AI synthesis
-
-#### 🗺️ **Knowledge Graph** — Visualize Relationships
-Interactive D3 graph showing:
-- Files ↔ Authors ↔ Commits ↔ Decisions
-- Who owns what
-- Where the expertise lives
-
-#### 🔥 **Risk Heatmap** — Identify Technical Debt
-Treemap visualization of file risk scores based on:
-- Commit churn
-- Number of authors
-- Time since last touch
-- Complexity indicators
-
-#### 🎓 **Onboarding Mode** — Personalized Learning Paths
-Generate role-specific 2-week onboarding plans:
-- Which files to read first
-- Who to pair with
-- Suggested starter tasks
-
----
-
-## 🚀 Quick Start
+## Setup
 
 ### Prerequisites
+
 - Node.js 18+
-- Supabase account (free tier works)
-- IBM watsonx.ai credentials (or use demo mode)
+- A free [Supabase](https://supabase.com) project
 
-### Installation
+### Install
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/codebase-time-machine.git
-cd codebase-time-machine
-
-# Install dependencies
 npm install
-
-# Set up environment variables
-cp .env.example .env.local
-# Edit .env.local with your credentials
-
-# Set up database
-# 1. Create Supabase project
-# 2. Run supabase-schema.sql in SQL Editor
-# 3. Enable pgvector extension
-
-# Run development server
-npm run dev
+npm install framer-motion   # see tech-stack note above
 ```
 
-Open [http://localhost:3000](http://localhost:3000) 🎉
+### Environment variables
 
-### Demo Mode (No Credentials Required)
+Create `.env.local` in the repo root (no `.env.example` is checked in, so set these manually):
 
 ```bash
-# In .env.local
-DEMO_MODE=true
-NEXT_PUBLIC_SUPABASE_URL=https://demo.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=demo-key
+# Required — Supabase
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+
+# AI — pick one
+DEMO_MODE=true                       # no AI credentials needed, uses mock responses
+# --- or ---
+WATSONX_API_KEY=your-api-key
+WATSONX_PROJECT_ID=your-project-id
+WATSONX_REGION=us-south              # defaults to us-south
+
+# Optional
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+RATE_LIMIT_MAX=100
+RATE_LIMIT_WINDOW_MS=900000
+MAX_INGESTION_COMMITS=1000
+UPSTASH_REDIS_REST_URL=...           # only used by src/lib/queue.ts, currently unwired
+UPSTASH_REDIS_REST_TOKEN=...
 ```
 
-Demo mode uses realistic mock AI responses — perfect for testing!
+### Database
 
----
+1. Create a Supabase project.
+2. Open the SQL Editor and run `supabase-schema.sql` — this creates the `repositories`, `commits`, `files`, `authors`, `adrs`, `chat_sessions`, and `chat_messages` tables, plus the `match_commits()` pgvector similarity function.
+3. Confirm the `vector` extension is enabled (the schema script does this with `create extension if not exists vector;`).
 
-## 📖 Usage
-
-### 1. Index a Repository
+### Run
 
 ```bash
-# Via UI
-Paste GitHub URL → Click "Index Repository"
+npm run setup     # validates .env.local and dependencies (scripts/setup.js)
+npm run dev       # start the dev server (Turbopack) at http://localhost:3000
+npm run test:api  # smoke-tests the API endpoints against a running dev server (scripts/test-api.js)
+npm run build     # production build
+npm start         # run the production build
+npm run lint      # eslint
+```
 
-# Via API
+### Trying it out
+
+```bash
 curl -X POST http://localhost:3000/api/repos/ingest \
   -H "Content-Type: application/json" \
   -d '{"url":"https://github.com/expressjs/express"}'
-```
 
-### 2. Ask Questions
+curl -N http://localhost:3000/api/repos/<id>/status   # watch ingestion progress via SSE
 
-Navigate to the repository dashboard and start chatting:
-
-```
-You: "Why was Express.js designed with middleware?"
-
-AI: Based on commit [a1b2c3d] by TJ Holowaychuk (2010-01-03), 
-the middleware pattern was adopted to provide a flexible, 
-composable way to handle HTTP requests...
-
-[Citations: 3 commits, 2 PRs]
-```
-
-### 3. Explore Time Travel
-
-Select any file → Scrub through its timeline → See AI summaries of major changes.
-
-### 4. Generate ADRs
-
-Click "Generate ADRs" → Get 5-15 architectural decision records extracted from history.
-
----
-
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Frontend — Next.js 14 (App Router)                     │
-│  • React + TailwindCSS + shadcn/ui                      │
-│  • D3.js for visualizations                             │
-│  • Framer Motion for animations                         │
-└─────────────────────────┬───────────────────────────────┘
-                          │ REST + SSE
-┌─────────────────────────▼───────────────────────────────┐
-│  Backend — Next.js API Routes (Serverless)              │
-│  • Repository ingestion pipeline                        │
-│  • RAG (Retrieval-Augmented Generation)                 │
-│  • Real-time progress streaming                         │
-└─────────────────────────┬───────────────────────────────┘
-                          │
-┌─────────────────────────▼───────────────────────────────┐
-│  Data Layer                                              │
-│  • PostgreSQL (Supabase) + pgvector                     │
-│  • Redis (optional) for caching                         │
-└─────────────────────────┬───────────────────────────────┘
-                          │
-┌─────────────────────────▼───────────────────────────────┐
-│  AI Layer — IBM watsonx.ai                              │
-│  • Granite 3.3 8B Instruct (LLM)                        │
-│  • Slate 30M (Embeddings)                               │
-└─────────────────────────────────────────────────────────┘
-```
-
-See [docs/BACKEND.md](./docs/BACKEND.md) for detailed API documentation.
-
----
-
-## 🛠️ Tech Stack
-
-| Layer | Technology | Why |
-|-------|-----------|-----|
-| **Frontend** | Next.js 14, React 19, TailwindCSS | Modern, fast, great DX |
-| **UI Components** | shadcn/ui, Radix UI | Accessible, customizable |
-| **Visualizations** | D3.js, Recharts | Powerful, flexible |
-| **Backend** | Next.js API Routes | Serverless, easy deploy |
-| **Database** | PostgreSQL (Supabase) | Robust, free tier |
-| **Vector Search** | pgvector | Native Postgres extension |
-| **LLM** | IBM watsonx.ai Granite | Powerful, cost-effective |
-| **Git Operations** | simple-git | Battle-tested Node.js lib |
-| **Deployment** | Vercel | One-click, edge network |
-
----
-
-## 🎨 Screenshots
-
-### Landing Page
-![Landing Page](./docs/screenshots/landing.png)
-
-### Why Engine Chat
-![Chat Interface](./docs/screenshots/chat.png)
-
-### Time Travel Mode
-![Time Travel](./docs/screenshots/time-travel.png)
-
-### Knowledge Graph
-![Knowledge Graph](./docs/screenshots/graph.png)
-
-### Risk Heatmap
-![Heatmap](./docs/screenshots/heatmap.png)
-
----
-
-## 🤖 Built with IBM Bob
-
-This entire application was designed and built inside the **IBM Bob IDE** as part of the Build on Bob Hackathon. Every feature, from the ingestion pipeline to the AI chat interface, was implemented with Bob as the development partner.
-
-### Bob Session Reports
-
-See the complete development journey in [`bob_sessions/`](./bob_sessions/):
-- 16+ task sessions
-- Architecture planning
-- Feature implementation
-- Debugging and refinement
-
-**Bob was used both as:**
-1. **Build Partner** — The IDE that built the app
-2. **Runtime Brain** — watsonx.ai powers the live AI features
-
----
-
-## 📊 Performance
-
-- **Ingestion:** 500 commits in < 60 seconds
-- **Chat Response:** Streams in < 3 seconds
-- **Vector Search:** < 100ms for 10k commits
-- **Graph Rendering:** < 2s for 200 nodes
-
----
-
-## 🚢 Deployment
-
-### Vercel (Recommended)
-
-```bash
-# Install Vercel CLI
-npm i -g vercel
-
-# Deploy
-vercel --prod
-
-# Set environment variables
-vercel env add NEXT_PUBLIC_SUPABASE_URL
-vercel env add WATSONX_API_KEY
-# ... etc
-```
-
-### Environment Variables
-
-Required in production:
-- `NEXT_PUBLIC_SUPABASE_URL`
-- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `WATSONX_API_KEY`
-- `WATSONX_PROJECT_ID`
-
-See [`.env.example`](./.env.example) for complete list.
-
----
-
-## 🧪 Testing
-
-```bash
-# Run development server
-npm run dev
-
-# Test ingestion
-curl -X POST http://localhost:3000/api/repos/ingest \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://github.com/lodash/lodash"}'
-
-# Monitor progress (SSE)
-curl -N http://localhost:3000/api/repos/[id]/status
-
-# Test chat
-curl -X POST http://localhost:3000/api/repos/[id]/chat \
+curl -X POST http://localhost:3000/api/repos/<id>/chat \
   -H "Content-Type: application/json" \
   -d '{"message":"Why was this architecture chosen?","mode":"why"}'
 ```
 
----
+## Notable technical decisions
 
-## 🗺️ Roadmap
+- **Demo mode by default.** Every AI call path (`chatCompletion`, `chatCompletionStream`, `generateEmbedding(s)` in `src/lib/watsonx.ts`) transparently falls back to deterministic mock output when `DEMO_MODE=true` or no API key is configured, including a graceful fallback if a live watsonx embedding call fails. This keeps the app fully clickable without IBM Cloud credentials.
+- **Vector search with a text-search fallback.** `retrieveContext()` in `src/lib/rag.ts` tries `pgvector` similarity search first and falls back to Postgres `textSearch` on the commit message if the RPC errors, rather than failing the chat request outright.
+- **Serverless-first ingestion.** Cloning and parsing run inside a Next.js API route with a 300-second `maxDuration` (see `vercel.json`), capped at 500 commits per repo and depth-limited git clones, to fit inside Vercel's serverless function limits rather than requiring a persistent worker process.
+- **Batch inserts.** Commits and files are inserted into Supabase in batches of 100, and embeddings are generated in batches of 20, to stay under request size/time limits during ingestion.
+- **Queue infrastructure exists ahead of use.** `src/lib/queue.ts` implements a full BullMQ + Upstash Redis job queue, distributed rate limiter, and cache layer, but the current ingestion and rate-limiting code paths don't call into it yet — ingestion is a fire-and-forget HTTP call and rate limiting is an in-memory `Map`. This looks like groundwork for a Phase 2 migration rather than dead code to delete.
 
-### Phase 2 (Post-Hackathon)
-- [ ] User authentication & workspaces
-- [ ] Private repository support (GitHub OAuth)
-- [ ] Slack integration
-- [ ] VS Code extension
+## Project structure
 
-### Phase 3 (Future)
-- [ ] Team knowledge graphs across repos
-- [ ] Custom ADR templates
-- [ ] Code review assistant
-- [ ] Jira/Linear integration
+```
+src/
+  app/
+    page.tsx                 # landing page
+    [repoId]/                # per-repo dashboard + chat/time-travel/adrs/ghost/graph pages
+    api/
+      repos/ingest/          # POST — start ingestion
+      repos/[id]/            # status, process, chat, adrs, files, timeline, authors, graph, heatmap, onboarding
+      commits/[sha]/         # commit detail + AI summary
+  components/
+    sections/                 # landing page sections (hero, features, pricing, faq, ...)
+    shared/                   # repo shell, navbar, ingest form, etc.
+    ui/                       # small Radix-based primitives (button, input, accordion, sheet, badge)
+  lib/
+    git-parser.ts             # clone + parse git history
+    watsonx.ts                 # IBM watsonx.ai client + demo-mode mocks
+    rag.ts                     # retrieval-augmented generation pipeline
+    queue.ts                   # BullMQ/Upstash queue, cache, rate limiter (not yet wired in)
+    middleware.ts              # in-memory rate limiting, error/response helpers
+    supabase.ts                 # Supabase client factories
+  types/index.ts               # shared TypeScript types
+supabase-schema.sql             # full Postgres schema + match_commits() RPC
+docs/BACKEND.md                 # detailed API reference
+docs/SETUP_GUIDE.md             # step-by-step setup walkthrough
+```
 
----
+## Documentation
 
-## 🤝 Contributing
-
-This is a hackathon project, but contributions are welcome!
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
----
-
-## 📄 License
-
-MIT License - see [LICENSE](./LICENSE) for details.
-
----
-
-## 🙏 Acknowledgments
-
-- **IBM watsonx.ai** for the powerful Granite models
-- **Supabase** for the excellent PostgreSQL platform
-- **Vercel** for seamless deployment
-- **Build on Bob Hackathon** for the inspiration
-
----
-
-## 📞 Contact
-
-Built by Manish Tiwari for the IBM Build on Bob Hackathon 2026.
-
-- 🌐 [Live Demo](./docs/videos/live-demo.mp4)
-- 📧 [Email](mailto:tiwarimanish2810@gmail.com)
-- 💼 [LinkedIn](https://www.linkedin.com/in/manish-tiwarisec/)
-
----
-
-<div align="center">
-
-**⭐ Star this repo if you find it useful!**
-
-Made with ❤️ and IBM Bob
-
-</div>
+- [`docs/BACKEND.md`](./docs/BACKEND.md) — full API endpoint reference (request/response shapes, status codes)
+- [`docs/SETUP_GUIDE.md`](./docs/SETUP_GUIDE.md) — a more granular setup walkthrough, including what's required vs. optional
